@@ -28,6 +28,86 @@ const TAB_TITLES: Record<LayoutMode, string> = {
 export function PracticeView() {
   const [settingsOpen, setSettingsOpen] = useState(false);
 
+  // ── 全屏 ─────────────────────────────────────────────────────────────────
+  // 移动浏览器地址栏会吃掉高度，全屏后可视区域最大；iOS 上 requestFullscreen
+  // 不存在，检测不到就不渲染按钮。
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const canFullscreen = useMemo(() => {
+    if (typeof document === "undefined") return false;
+    const el = document.documentElement as HTMLElement & {
+      webkitRequestFullscreen?: () => Promise<void>;
+    };
+    return (
+      typeof el.requestFullscreen === "function" || typeof el.webkitRequestFullscreen === "function"
+    );
+  }, []);
+
+  useEffect(() => {
+    const doc = document as Document & { webkitFullscreenElement?: Element | null };
+    const sync = () =>
+      setIsFullscreen(Boolean(doc.fullscreenElement ?? doc.webkitFullscreenElement));
+    document.addEventListener("fullscreenchange", sync);
+    document.addEventListener("webkitfullscreenchange", sync);
+    sync();
+    return () => {
+      document.removeEventListener("fullscreenchange", sync);
+      document.removeEventListener("webkitfullscreenchange", sync);
+    };
+  }, []);
+
+  // 平板练琴时屏幕一睡，USB 总线很可能跟着挂起，琴的 MIDI 流就断了。
+  // 申请 Screen Wake Lock：页面可见时保持屏幕常亮（不支持就静默跳过）。
+  useEffect(() => {
+    type Sentinel = { release: () => Promise<void> };
+    const nav = navigator as Navigator & {
+      wakeLock?: { request: (type: "screen") => Promise<Sentinel> };
+    };
+    let sentinel: Sentinel | null = null;
+
+    const acquire = async () => {
+      if (!nav.wakeLock || document.visibilityState !== "visible") return;
+      try {
+        sentinel = await nav.wakeLock.request("screen");
+      } catch {
+        /* 不支持 / 被省电策略拒绝，忽略 */
+      }
+    };
+
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void acquire();
+    };
+
+    void acquire();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      void sentinel?.release().catch(() => {});
+    };
+  }, []);
+
+  const toggleFullscreen = useCallback(async () => {
+    const doc = document as Document & {
+      webkitFullscreenElement?: Element | null;
+      webkitExitFullscreen?: () => Promise<void>;
+    };
+    const el = document.documentElement as HTMLElement & {
+      webkitRequestFullscreen?: () => Promise<void>;
+    };
+    try {
+      if (doc.fullscreenElement ?? doc.webkitFullscreenElement) {
+        if (typeof doc.exitFullscreen === "function") await doc.exitFullscreen();
+        else await doc.webkitExitFullscreen?.();
+      } else if (typeof el.requestFullscreen === "function") {
+        await el.requestFullscreen();
+      } else {
+        await el.webkitRequestFullscreen?.();
+      }
+    } catch (err) {
+      // 浏览器可能拒绝（权限策略 / 非用户手势），不影响使用
+      console.warn("[b2b] fullscreen toggle failed", err);
+    }
+  }, []);
+
   const {
     loadMidiFile,
     loadMusicXmlFile,
@@ -137,7 +217,7 @@ export function PracticeView() {
 
   return (
     <div
-      className="flex flex-col h-screen"
+      className="flex flex-col app-viewport"
       onDragOver={(e) => e.preventDefault()}
       onDrop={handleDrop}
     >
@@ -148,6 +228,7 @@ export function PracticeView() {
           - Right group: marginLeft:auto, pushes to far right
           This pattern is immune to left/right asymmetry that breaks grid-based centering. */}
       <header
+        data-app-header
         className="flex-shrink-0 flex items-center"
         style={{
           position: "relative",
@@ -182,6 +263,7 @@ export function PracticeView() {
           </div>
           {/* Typographic pun: "Bach" and "Basics" bold, "to" muted */}
           <span
+            className="hidden sm:inline"
             style={{ fontSize: 15, whiteSpace: "nowrap", letterSpacing: "-0.3px", lineHeight: 1 }}
           >
             <span style={{ fontWeight: 700, color: "var(--color-text)" }}>Bach</span>
@@ -194,10 +276,7 @@ export function PracticeView() {
         </a>
 
         {/* Center: layout mode tabs - absolutely centered in the header */}
-        <div
-          className="flex items-center"
-          style={{ position: "absolute", left: "50%", transform: "translateX(-50%)" }}
-        >
+        <div className="header-tabs flex items-center">
           <div
             className="flex items-center"
             style={{
@@ -232,8 +311,25 @@ export function PracticeView() {
         </div>
 
         {/* Right: MIDI device chip + theme toggle + settings gear */}
-        <div className="flex items-center gap-1.5" style={{ marginLeft: "auto" }}>
+        <div className="flex items-center gap-1" style={{ marginLeft: "auto" }}>
           <DevicePanel />
+          {canFullscreen && (
+            <button
+              onClick={toggleFullscreen}
+              title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+              aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+              className="flex items-center justify-center rounded transition-colors shrink-0"
+              style={{
+                width: 30,
+                height: 30,
+                background: "var(--color-surface-2)",
+                border: "1px solid var(--color-border)",
+                color: "var(--color-text-muted)",
+              }}
+            >
+              {isFullscreen ? <ExitFullscreenIcon /> : <FullscreenIcon />}
+            </button>
+          )}
           <button
             onClick={() => updateSettings({ theme: settings.theme === "dark" ? "light" : "dark" })}
             title={settings.theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
@@ -627,6 +723,22 @@ function StatusBar() {
         <span>No file loaded - drag &amp; drop or click ↑ Import</span>
       )}
       <div className="flex-1 min-w-0" />
+      <button
+        type="button"
+        onClick={() => window.location.reload()}
+        title={`Build ${__APP_BUILD__} · Reload page`}
+        aria-label={`Reload page · Build ${__APP_BUILD__}`}
+        className="shrink-0"
+        style={{
+          color: "inherit",
+          background: "transparent",
+          border: 0,
+          cursor: "pointer",
+          fontSize: 11,
+        }}
+      >
+        {__APP_BUILD__} ↻
+      </button>
       {doc && (
         <span className="shrink-0">
           {fmt(currentSeconds)} / {fmt(doc.totalDuration)}
@@ -736,6 +848,40 @@ const SunIcon = () => (
 const MoonIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
     <path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z" />
+  </svg>
+);
+const FullscreenIcon = () => (
+  <svg
+    width="14"
+    height="14"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <path d="M8 3H5a2 2 0 0 0-2 2v3" />
+    <path d="M16 3h3a2 2 0 0 1 2 2v3" />
+    <path d="M8 21H5a2 2 0 0 1-2-2v-3" />
+    <path d="M16 21h3a2 2 0 0 0 2-2v-3" />
+  </svg>
+);
+const ExitFullscreenIcon = () => (
+  <svg
+    width="14"
+    height="14"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <path d="M8 3v3a2 2 0 0 1-2 2H3" />
+    <path d="M16 3v3a2 2 0 0 0 2 2h3" />
+    <path d="M8 21v-3a2 2 0 0 0-2-2H3" />
+    <path d="M16 21v-3a2 2 0 0 1 2-2h3" />
   </svg>
 );
 const GearIcon = () => (

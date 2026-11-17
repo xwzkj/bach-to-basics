@@ -76,6 +76,13 @@ class SyncEngine {
   private transposeSemitones = 0;
   private countInBars: 0 | 1 | 2 = 0;
   private countInTimeouts: ReturnType<typeof setTimeout>[] = [];
+  // Freeze the chord targets when pausing; every target pitch must be played.
+  private waitTargets = new Set<number>();
+  private playedWaitTargets = new Set<number>();
+  /** 等待模式下被卡住的那组音的起始时间（消费整组和弦用） */
+  private waitNoteStart: number | null = null;
+  /** 视觉预渲染用的游标，和音频调度游标分开 */
+  private announceIndex = 0;
   private speedTrainer: SpeedTrainerOpts = {
     enabled: false,
     startPct: 60,
@@ -94,6 +101,8 @@ class SyncEngine {
     this.stop();
     this.doc = doc;
     this.noteIndex = 0;
+    this.announceIndex = 0;
+    this.waitNoteStart = null;
     this.activeNotes.clear();
     this._state.currentSeconds = 0;
     bus.emit("document:loaded", { id: doc.id, title: doc.title, totalDuration: doc.totalDuration });
@@ -151,9 +160,13 @@ class SyncEngine {
       await this._playWithCountIn(startFrom);
     } else {
       this.seekTo(startFrom);
+      // 先标成 playing 再启动时钟：第一个 tick 会在 clock.start 期间就跑起来，
+      // 那会儿状态还是 stopped 的话，第一拍不会触发等待模式，会直接从第二个音开始等。
+      this._state.status = "playing";
       await this.clock.start(startFrom);
       this.startAnimLoop();
-      this.emitState("playing");
+      // tick 里可能已经暂停并切到 waiting 了，别把它覆盖回去
+      if (this._state.status === "playing") this.emitState("playing");
     }
   }
 
@@ -193,9 +206,11 @@ class SyncEngine {
     const startId = setTimeout(async () => {
       this.countInTimeouts = [];
       this.seekTo(startFrom);
+      this._state.status = "playing";
       await this.clock.start(startFrom);
       this.startAnimLoop();
-      // status stays "playing"
+      // tick 里可能已经暂停进入 waiting，保持它的状态
+      if (this._state.status === "playing") this.emitState("playing");
     }, totalBeats * beatDurMs);
     this.countInTimeouts.push(startId);
   }
@@ -214,6 +229,8 @@ class SyncEngine {
 
   stop() {
     this._cancelCountIn();
+    this.clearWaitTargets();
+    this.announceIndex = 0;
     this.clock.stop();
     this.audio.stopAll();
     this.stopAnimLoop();
@@ -227,6 +244,7 @@ class SyncEngine {
 
   seek(seconds: number) {
     const wasPlaying = this._state.status === "playing" || this._state.status === "waiting";
+    this.clearWaitTargets();
     if (wasPlaying) this.clock.pause();
 
     // Tell the UI to release all visually-pressed keys before we cancel Tone events.
@@ -244,8 +262,8 @@ class SyncEngine {
     if (wasPlaying) {
       // cancel() above killed the scheduleRepeat - rebuild it before resuming
       this.clock.reschedule(seconds);
-      this.clock.resume();
       this._state.status = "playing";
+      this.clock.resume();
     }
     this.emitState(this._state.status);
   }
@@ -276,8 +294,8 @@ class SyncEngine {
       this.audio.stopAll();
       this.seekTo(currentSec); // resets noteIndex + activeNotes
       this.clock.reschedule(currentSec);
-      this.clock.resume();
       this._state.status = "playing";
+      this.clock.resume();
     }
 
     this.emitState(this._state.status);
@@ -290,7 +308,18 @@ class SyncEngine {
   }
 
   setWaitMode(on: boolean) {
+    if (this._state.waitMode === on) return;
     this._state.waitMode = on;
+    if (!on) {
+      this.clearWaitTargets();
+      if (this._state.status === "waiting") {
+        this._state.status = "playing";
+        this.clock.resume();
+      }
+    } else if (this._state.status === "playing" || this._state.status === "paused") {
+      // Discard the old five-second audio queue before using the wait horizon.
+      this.seek(this.clock.currentSeconds);
+    }
     this.emitState(this._state.status);
   }
 
@@ -310,6 +339,7 @@ class SyncEngine {
 
   setActiveHands(hands: Set<"left" | "right">) {
     this._state.activeHands = hands;
+    this.refreshWaitTargets();
     this.emitState(this._state.status);
   }
 
@@ -322,6 +352,7 @@ class SyncEngine {
 
   setWaitForHand(hand: "left" | "right" | "both") {
     this._state.waitForHand = hand;
+    this.refreshWaitTargets();
   }
 
   async setInstrument(id: InstrumentId): Promise<void> {
@@ -336,6 +367,8 @@ class SyncEngine {
 
   setTranspose(semitones: number) {
     this.transposeSemitones = Math.round(Math.max(-12, Math.min(12, semitones)));
+    this.playedWaitTargets.clear();
+    this.refreshWaitTargets();
   }
 
   setCountInBars(n: 0 | 1 | 2) {
@@ -356,13 +389,9 @@ class SyncEngine {
   onMidiInput(midi: number, velocity: number) {
     bus.emit("input:note:on", { midi, velocity });
 
-    if (this._state.status === "waiting") {
-      const expected = this.waitingNote();
-      if (expected && midi === expected.midi) {
-        this._state.status = "playing";
-        this.clock.resume();
-        this.emitState("playing");
-      }
+    if (velocity > 0 && this._state.status === "waiting" && this.waitTargets.delete(midi)) {
+      this.playedWaitTargets.add(midi);
+      if (this.waitTargets.size === 0) this.finishWait();
     }
   }
 
@@ -411,20 +440,119 @@ class SyncEngine {
     this._state.currentSeconds = seconds;
     this.noteIndex = this.doc.notes.findIndex((n) => n.startSeconds >= seconds);
     if (this.noteIndex === -1) this.noteIndex = this.doc.notes.length;
+    this.announceIndex = this.noteIndex;
     this.activeNotes.clear();
+    this.clearWaitTargets();
     // Reset metronome so the first beat at new position doesn't double-fire
     const bpm = this.doc.tempoMap[0]?.bpm ?? 120;
     this.lastBeatCrossed = Math.floor(seconds / (60 / bpm));
   }
 
-  private waitingNote(): NoteEvent | null {
-    if (!this.doc || this.noteIndex >= this.doc.notes.length) return null;
-    const note = this.doc.notes[this.noteIndex];
+  private clearWaitTargets() {
+    this.waitTargets.clear();
+    this.playedWaitTargets.clear();
+    this.waitNoteStart = null;
+  }
+
+  private finishWait() {
+    this.consumeWaitTargets();
+    this.clearWaitTargets();
+    this._state.status = "playing";
+    this.clock.resume();
+    this.emitState("playing");
+  }
+
+  // Changing the selected hands must not leave stale or impossible targets.
+  private refreshWaitTargets() {
+    if (this._state.status !== "waiting" || this.waitNoteStart === null) return;
+    this.waitTargets = this.collectWaitTargets(this.waitNoteStart);
+    for (const midi of this.playedWaitTargets) this.waitTargets.delete(midi);
+    if (this.waitTargets.size === 0) this.finishWait();
+  }
+
+  /** Consume the acknowledged chord, leaving later onsets for the next tick. */
+  private consumeWaitTargets() {
+    const start = this.waitNoteStart;
+    if (start === null || !this.doc) return;
+    while (this.noteIndex < this.doc.notes.length) {
+      const n = this.doc.notes[this.noteIndex];
+      if (n.startSeconds > start + 0.06) break;
+      // Only the practised hand was supplied by the player. Preserve the other
+      // hand's accompaniment, regardless of its order in the document's chord.
+      const isAccompaniment =
+        this._state.waitForHand !== "both" &&
+        n.hand !== "unknown" &&
+        n.hand !== this._state.waitForHand;
+      if (isAccompaniment && !this.activeNotes.has(n.id)) {
+        this.scheduleNote(n, this.clock.currentSeconds);
+      }
+      this.activeNotes.add(n.id);
+      this.noteIndex++;
+    }
+  }
+
+  private collectWaitTargets(start: number): Set<number> {
+    const targets = new Set<number>();
     const { activeHands, waitForHand } = this._state;
-    if (note.hand !== "unknown" && !activeHands.has(note.hand as "left" | "right")) return null;
-    // When waitForHand restricts to one hand, ignore notes from the other hand
-    if (waitForHand !== "both" && note.hand !== "unknown" && note.hand !== waitForHand) return null;
-    return note;
+    for (const n of this.doc?.notes ?? []) {
+      // Only include the current/following notes; already consumed onsets are past.
+      if (n.startSeconds < start || n.startSeconds > start + 0.06) continue;
+      if (n.hand !== "unknown" && !activeHands.has(n.hand as "left" | "right")) continue;
+      if (waitForHand !== "both" && n.hand !== "unknown" && n.hand !== waitForHand) continue;
+      targets.add(this.transposeNote(n).midi);
+    }
+    return targets;
+  }
+
+  private scheduleNote(note: NoteEvent, docSeconds: number) {
+    // Apply transposition (creates a new NoteEvent if needed, preserves original id)
+    const tNote = this.transposeNote(note);
+
+    // Convert doc-time offset to real-time for Tone.js scheduling.
+    // renderOffsetMs > 0 means audio plays earlier (compensates for delayed output).
+    const offsetSec = this.renderOffsetMs / 1000;
+    const onDelay = Math.max(
+      0,
+      (note.startSeconds - docSeconds) / this._state.tempoMultiplier - offsetSec
+    );
+    const offDelay = Math.max(
+      0,
+      (note.endSeconds - docSeconds) / this._state.tempoMultiplier - offsetSec
+    );
+
+    const noteOn = () => {
+      // Read activeHands at fire-time so hand toggles take effect immediately
+      // (not at schedule-time, which would lag up to LOOKAHEAD_DOC_SECONDS).
+      const isActive =
+        note.hand === "unknown" || this._state.activeHands.has(note.hand as "left" | "right");
+      if (isActive) {
+        bus.emit("note:on", tNote);
+        // Apply per-hand volume multiplier (also read at fire-time for instant effect)
+        const handVol =
+          note.hand === "left"
+            ? this._state.handVolume.left
+            : note.hand === "right"
+              ? this._state.handVolume.right
+              : 1;
+        const scaledNote =
+          handVol === 1
+            ? tNote
+            : { ...tNote, velocity: Math.max(1, Math.round(tNote.velocity * handVol)) };
+        this.audio.playNote(scaledNote);
+      }
+    };
+    const noteOff = () => {
+      bus.emit("note:off", tNote);
+      this.audio.stopNote(tNote.midi);
+    };
+
+    // A paused/resuming Transport can already have processed its current tick.
+    // scheduleOnce("+0") then inserts into the past and silently drops note-on.
+    // Due notes must fire now; only future events belong in the Transport queue.
+    if (onDelay === 0) noteOn();
+    else Tone.getTransport().scheduleOnce(noteOn, `+${onDelay}`);
+    if (offDelay === 0) noteOff();
+    else Tone.getTransport().scheduleOnce(noteOff, `+${offDelay}`);
   }
 
   /**
@@ -445,7 +573,7 @@ class SyncEngine {
    *   realDelay = docTimeDiff / tempoMultiplier
    */
   private onTick(docSeconds: number) {
-    if (!this.doc) return;
+    if (!this.doc || this._state.status !== "playing") return;
     this._state.currentSeconds = docSeconds;
 
     // ── Metronome ─────────────────────────────────────────────────────────────
@@ -463,7 +591,7 @@ class SyncEngine {
     }
 
     // ── Loop ──────────────────────────────────────────────────────────────────
-    const { loopStart, loopEnd, tempoMultiplier } = this._state;
+    const { loopStart, loopEnd } = this._state;
     if (loopStart !== null && loopEnd !== null && docSeconds >= loopEnd) {
       // Speed trainer: bump tempo on each loop wrap (only while below target)
       if (this.speedTrainer.enabled) {
@@ -487,72 +615,52 @@ class SyncEngine {
       return;
     }
 
-    // ── Schedule upcoming notes ───────────────────────────────────────────────
+    // ── 视觉预渲染：提前 5 秒把音符发给 falling notes ─────────────────────────
     const notes = this.doc.notes;
+    while (this.announceIndex < notes.length) {
+      const n = notes[this.announceIndex];
+      if (n.startSeconds > docSeconds + LOOKAHEAD_DOC_SECONDS) break;
+      bus.emit("note:upcoming", this.transposeNote(n));
+      this.announceIndex++;
+    }
+
+    // ── 音频调度 ──────────────────────────────────────────────────────────────
+    // 等待模式把调度窗口收到 60ms：这样每个音都在“快到”的时候被检查一次，
+    // 而不是提前 5 秒就排进 Tone，导致除第一个音外永远不触发等待。
+    const schedWindow = this._state.waitMode ? 0.06 : LOOKAHEAD_DOC_SECONDS;
     while (this.noteIndex < notes.length) {
       const note = notes[this.noteIndex];
 
       // note.startSeconds is in doc-time; compare directly to docSeconds
-      if (note.startSeconds > docSeconds + LOOKAHEAD_DOC_SECONDS) break;
+      if (note.startSeconds > docSeconds + schedWindow) break;
       if (this.activeNotes.has(note.id)) {
         this.noteIndex++;
         continue;
       }
 
-      // Apply transposition (creates a new NoteEvent if needed, preserves original id)
-      const tNote = this.transposeNote(note);
-
-      bus.emit("note:upcoming", tNote);
-      this.activeNotes.add(note.id);
-
-      // Convert doc-time offset to real-time for Tone.js scheduling.
-      // renderOffsetMs > 0 means audio plays earlier (compensates for delayed output).
-      const offsetSec = this.renderOffsetMs / 1000;
-      const onDelay = Math.max(0, (note.startSeconds - docSeconds) / tempoMultiplier - offsetSec);
-      const offDelay = Math.max(0, (note.endSeconds - docSeconds) / tempoMultiplier - offsetSec);
-
-      Tone.getTransport().scheduleOnce(() => {
-        // Read activeHands at fire-time so hand toggles take effect immediately
-        // (not at schedule-time, which would lag up to LOOKAHEAD_DOC_SECONDS).
-        const isActive =
-          note.hand === "unknown" || this._state.activeHands.has(note.hand as "left" | "right");
-        if (isActive) {
-          bus.emit("note:on", tNote);
-          // Apply per-hand volume multiplier (also read at fire-time for instant effect)
-          const handVol =
-            note.hand === "left"
-              ? this._state.handVolume.left
-              : note.hand === "right"
-                ? this._state.handVolume.right
-                : 1;
-          const scaledNote =
-            handVol === 1
-              ? tNote
-              : { ...tNote, velocity: Math.max(1, Math.round(tNote.velocity * handVol)) };
-          this.audio.playNote(scaledNote);
-        }
-      }, `+${onDelay}`);
-
-      Tone.getTransport().scheduleOnce(() => {
-        bus.emit("note:off", tNote);
-        this.audio.stopNote(tNote.midi);
-      }, `+${offDelay}`);
-
-      // Wait mode
+      // 等待判定放在调度之前：暂停时这个音既不排进 Tone 也不前进，
+      // 由用户按键后 consumeWaitTargets() 整组消费掉。
       if (this._state.waitMode && this._state.status === "playing") {
         const isActive =
           note.hand === "unknown" || this._state.activeHands.has(note.hand as "left" | "right");
-        // Only pause for the targeted hand (waitForHand); "both" = current behavior
         const isWaited =
           this._state.waitForHand === "both" ||
           note.hand === "unknown" ||
           note.hand === this._state.waitForHand;
-        if (isActive && isWaited && onDelay <= 0.05) {
+        if (isActive && isWaited) {
+          // Every note admitted by the 60ms horizon must either wait or schedule.
+          this.playedWaitTargets.clear();
+          this.waitTargets = this.collectWaitTargets(note.startSeconds);
+          this.waitNoteStart = note.startSeconds;
           this.clock.pause();
           this._state.status = "waiting";
           this.emitState("waiting");
+          break;
         }
       }
+
+      this.activeNotes.add(note.id);
+      this.scheduleNote(note, docSeconds);
 
       this.noteIndex++;
     }
@@ -574,6 +682,7 @@ class SyncEngine {
   // rAF loop: emits transport:tick at 60fps for smooth visuals.
   // State listeners throttled to ~10fps to avoid React re-renders.
   private startAnimLoop() {
+    this.stopAnimLoop();
     let lastStateMs = 0;
     const loop = () => {
       const seconds = this.clock.currentSeconds;

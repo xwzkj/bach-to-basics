@@ -1,6 +1,9 @@
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import App from "./App";
+import { retireLegacyPwa } from "./utils/retireLegacyPwa";
+
+retireLegacyPwa();
 
 // StrictMode deliberately double-mounts in dev, which conflicts with Pixi.js's
 // async init - Application.destroy() fires before init() resolves.

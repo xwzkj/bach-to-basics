@@ -128,6 +128,7 @@ interface KeyState {
 export class PianoKeyboard {
   app: PIXI.Application;
   private _initialized = false;
+  private _destroyed = false;
 
   private keyContainers = new Map<number, PIXI.Container>();
   private keys = new Map<number, PIXI.Graphics>();
@@ -162,6 +163,7 @@ export class PianoKeyboard {
   }
 
   async init(canvas: HTMLCanvasElement) {
+    if (this._destroyed) return;
     await this.app.init({
       canvas,
       width: this.opts.width,
@@ -172,10 +174,18 @@ export class PianoKeyboard {
       autoDensity: true,
       ...(import.meta.env.DEV ? { preserveDrawingBuffer: true } : {}),
     });
+    // React may have unmounted while Application.init() was awaiting a renderer.
+    if (this._destroyed) {
+      this.app.destroy(false, { children: true });
+      return;
+    }
     window.addEventListener("pointerup", this.onWindowPointerUp);
+    // Options/size can change before async renderer initialization completes.
+    this.app.renderer.resize(this.opts.width, this.opts.height);
     this.computeLayout();
     this.drawKeys();
     this._initialized = true;
+    this.app.render();
   }
 
   // ── Layout ────────────────────────────────────────────────────────────────
@@ -510,6 +520,42 @@ export class PianoKeyboard {
     this.redrawKey(midi);
   }
 
+  /** Recreate canvas-backed gradient textures after an Android file picker returns.
+   * Pixi restores its GL resources itself, but repainting with the same cached
+   * FillGradient objects can retain a blank gradient texture on mobile GPUs. */
+  refresh(): boolean {
+    if (!this._initialized || this._destroyed) return false;
+    this.rebuildKeys();
+    this.app.render();
+    return true;
+  }
+
+  private clearKeys() {
+    // removeChildren() alone leaves graphics/text resources alive on every resize.
+    for (const child of this.app.stage.removeChildren())
+      child.destroy({ children: true, context: true });
+    for (const gradient of this.gradCache.values()) gradient.destroy();
+    this.gradCache.clear();
+    this.keyX.clear();
+    this.keys.clear();
+    this.keyContainers.clear();
+    this.keyLabels.clear();
+    this.fingerLabels.clear();
+    this.keyStates.clear();
+  }
+
+  private rebuildKeys() {
+    const states = new Map(this.keyStates);
+    this.clearKeys();
+    this.computeLayout();
+    this.drawKeys();
+    // A focus/resize recovery must not drop held MIDI keys or playback highlights.
+    for (const [midi, state] of states) {
+      this.keyStates.set(midi, state);
+      this.redrawKey(midi);
+    }
+  }
+
   reset() {
     for (const [midi] of this.keys) {
       const state = this.keyStates.get(midi);
@@ -553,32 +599,26 @@ export class PianoKeyboard {
   }
 
   resize(width: number, height: number) {
-    if (!this._initialized) return;
+    if (this._destroyed || width <= 0 || height <= 0) return;
     this.opts.width = width;
     this.opts.height = height;
+    if (!this._initialized) return;
     this.app.renderer.resize(width, height);
-
-    // Destroy cached gradients so they get rebuilt at new dimensions
-    for (const g of this.gradCache.values()) g.destroy();
-    this.gradCache.clear();
-
-    this.keyX.clear();
-    this.keys.clear();
-    this.keyContainers.clear();
-    this.keyLabels.clear();
-    this.fingerLabels.clear();
-    this.keyStates.clear();
-    this.app.stage.removeChildren();
-    this.computeLayout();
-    this.drawKeys();
+    this.rebuildKeys();
   }
 
   destroy() {
+    if (this._destroyed) return;
+    this._destroyed = true;
     window.removeEventListener("pointerup", this.onWindowPointerUp);
+    for (const midi of this.dragKeys) this.opts.onKeyRelease?.(midi);
+    this.dragKeys.clear();
+    this.isPointerDown = false;
     if (this._initialized) {
-      for (const g of this.gradCache.values()) g.destroy();
-      this.gradCache.clear();
+      this._initialized = false;
+      this.clearKeys();
       this.app.destroy(false, { children: true });
     }
+    // If init() is pending it will destroy the application when it resolves.
   }
 }
