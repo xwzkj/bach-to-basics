@@ -50,7 +50,12 @@ export async function createPlayer(id: InstrumentId, ctx: BaseAudioContext): Pro
   const { SplendidGrandPiano, Soundfont, ElectricPiano } = await import("smplr");
   switch (id) {
     case "grand":
-      return new SplendidGrandPiano(ctx as AudioContext) as unknown as Player;
+      // 本机部署补丁：采样改从本站 /samples 读（同 frontend/public/samples）。
+      // 原始 GitHub Pages 源在国内加载 226 个采样要几分钟，而 play() 会等全部加载完，
+      // 结果就是按下播放没反应。
+      return new SplendidGrandPiano(ctx as AudioContext, {
+        baseUrl: "/samples/splendid-grand-piano",
+      }) as unknown as Player;
     case "bright":
       return new Soundfont(ctx as AudioContext, {
         instrument: "bright_acoustic_piano",

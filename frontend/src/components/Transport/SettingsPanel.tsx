@@ -474,11 +474,11 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
 
       {/* Drawer */}
       <div
+        className="app-viewport"
         style={{
           position: "fixed",
           right: 0,
           top: 0,
-          height: "100vh",
           width: 360,
           zIndex: 1000,
           transform: open ? "translateX(0)" : "translateX(100%)",

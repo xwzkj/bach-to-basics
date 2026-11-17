@@ -115,6 +115,77 @@ body,
   overflow: hidden;
 }
 
+/* 移动浏览器的地址栏伸缩：100vh 按“最大视口”算，底部会被裁掉。
+   有 dvh 就用动态视口高度，老浏览器退回 100vh。 */
+.app-viewport {
+  height: 100vh;
+}
+
+@supports (height: 100dvh) {
+  html,
+  body,
+  #root,
+  .app-viewport {
+    height: 100dvh;
+  }
+}
+
+
+/* ── Header 响应式：宽屏 tab 绝对居中；<=1023 改成弹性布局，避免挤掉右侧按钮 ── */
+.midi-chip {
+  max-width: 200px;
+}
+
+.header-tabs {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+/* 平板/横屏手机也走弹性布局：tab 可压缩，右侧按钮/设备名再长也不会压到 tab 上。
+   只有宽屏（>=1024）才用绝对居中，保证视觉上真正居中。 */
+@media (max-width: 1023px) {
+  .header-tabs {
+    position: static;
+    transform: none;
+    flex: 1 1 auto;
+    min-width: 0;
+    margin: 0 6px;
+    justify-content: center;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .header-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .header-tabs button {
+    /* 覆盖行内 padding/font-size，给右侧按钮腾地方 */
+    padding: 4px 6px !important;
+    font-size: 11px !important;
+  }
+
+  /* 连接的琴名可能很长，限宽并截断 */
+  .midi-chip {
+    max-width: 150px;
+    overflow: hidden;
+  }
+
+  /* 窄屏把 header 内边距和右侧按钮间距收紧一点，保证 MIDI 状态不被挤 */
+  header[data-app-header] {
+    padding-left: 8px !important;
+    padding-right: 8px !important;
+  }
+}
+
+@media (max-width: 767px) {
+  /* 窄屏只显示 ⚠，把 "MIDI" 两个字让给按钮 */
+  .midi-chip-label {
+    display: none;
+  }
+}
+
 /* ── Typography scale ──────────────────────────────────────────────────────── */
 .text-label {
   font-size: 11px;
