@@ -185,6 +185,39 @@ describe("SyncEngine wait mode", () => {
     expect(engine.state.status).toBe("playing");
   });
 
+  it("defers same-onset accompaniment until the practised hand is played", async () => {
+    engine.setWaitForHand("left");
+    await startWaiting([note(72, 0, "right"), note(48, 0, "left")]);
+    expect(engine.state.status).toBe("waiting");
+    expect(mocks.audio.playNote).not.toHaveBeenCalled();
+    engine.onMidiInput(48, 90);
+    expect(engine.state.status).toBe("playing");
+    expect(mocks.audio.playNote).toHaveBeenCalledExactlyOnceWith(note(72, 0, "right"));
+  });
+
+  it("accepts a correct note played shortly before the wait pause in relaxed mode", async () => {
+    engine.setWaitForHand("left");
+    await engine.loadDocument(document([note(48, 0.1, "left"), note(72, 0.1, "right")]));
+    engine.setWaitMode(true);
+    await engine.play();
+    engine.onMidiInput(48, 90);
+    expect(engine.state.status).toBe("playing");
+    tick(0.1);
+    expect(engine.state.status).toBe("playing");
+    expect(mocks.audio.playNote).toHaveBeenCalledExactlyOnceWith(note(72, 0.1, "right"));
+  });
+
+  it("keeps early notes invalid in strict mode", async () => {
+    engine.setWaitForHand("left");
+    engine.setWaitStrict(true);
+    await engine.loadDocument(document([note(48, 0.1, "left")]));
+    engine.setWaitMode(true);
+    await engine.play();
+    engine.onMidiInput(48, 90);
+    tick(0.1);
+    expect(engine.state.status).toBe("waiting");
+  });
+
   it("matches transposed pitches and deduplicates pitches clamped to the piano range", async () => {
     engine.setTranspose(12);
     await startWaiting([note(60), note(100), note(106)]);

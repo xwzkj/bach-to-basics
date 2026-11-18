@@ -51,7 +51,7 @@ Drag-and-drop anywhere on the window, or use the import button.
 
 - **A/B loop** with click-to-set markers; the loop region highlights across all three views
 - **Speed trainer**: auto-ramps tempo on each loop pass (configurable start %, end %, step %)
-- **Wait mode**: playback pauses until you play the correct note. Per-hand: wait for left only, right only, or both.
+- **Wait mode**: playback pauses until you play the correct note. Per-hand: wait for left only, right only, or both. Relaxed timing accepts a correct note up to 150 ms early; enable Strict wait to require the original pause-then-play behavior.
 - **Count-in**: 0, 1, or 2 bars of metronome before the music starts
 - **Metronome**: accent on downbeat
 - **Transposition**: shift the whole score ±12 semitones

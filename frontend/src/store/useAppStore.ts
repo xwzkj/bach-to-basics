@@ -100,6 +100,12 @@ export interface AppSettings {
   instrument: InstrumentId;
   /** Which hand(s) trigger wait-mode pauses ("both" = default, all hands) */
   waitForHand: "left" | "right" | "both";
+  /** Whether Wait mode is enabled (persisted practice preference). */
+  waitMode: boolean;
+  /** Whether Wait mode only accepts notes pressed after playback pauses. */
+  waitStrict: boolean;
+  /** User-selected playback tempo outside speed-trainer progress. */
+  tempoMultiplier: number;
   /** Draw a colored outline stroke around falling note bars */
   showNoteOutline: boolean;
   // ── MIDIano live-app additions ────────────────────────────────────────────
@@ -155,6 +161,7 @@ export interface AppState {
   setTempoMultiplier: (v: number) => void;
   setLoopPoints: (start: number | null, end: number | null) => void;
   setWaitMode: (on: boolean) => void;
+  setWaitStrict: (on: boolean) => void;
   setActiveHands: (hands: Set<"left" | "right">) => void;
   setMetronome: (on: boolean) => void;
   updateSettings: (patch: Partial<AppSettings>) => void;
@@ -164,32 +171,47 @@ export interface AppState {
   syncEngineState: () => void;
 }
 
-/** localStorage key for persisting the user's theme choice across reloads. */
+/** Storage keys for user settings. Playback/document state is intentionally excluded. */
 const THEME_STORAGE_KEY = "b2b-theme";
+const SETTINGS_STORAGE_KEY = "b2b-settings";
 
-/**
- * Initial theme - the standard "system default + persisted override" pattern
- * used by GitHub, Linear, Notion, Vercel, etc.:
- *
- *   1. If the user has previously toggled, honor that choice (localStorage)
- *   2. Otherwise match the OS preference (`prefers-color-scheme: dark`)
- *   3. Fall back to light
- *
- * Runs at module load (before React mounts) so the first paint is correct -
- * no flash of wrong theme on reload.
- */
-function getInitialTheme(): "dark" | "light" {
-  if (typeof window === "undefined") return "light";
+const HANDS = ["left", "right"] as const;
+const NOTE_FILTERS = ["all", "white", "black", "c_only"] as const;
+const COLOR_THEMES = ["violet", "classic", "ocean", "forest", "cascade", "custom"] as const;
+const LAYOUT_MODES = ["falling", "sheet", "piano", "all"] as const;
+const NOTE_LABEL_MODES = ["none", "c_only", "white", "black", "all"] as const;
+const IMPACT_STYLES = ["off", "bloom", "side", "trail"] as const;
+const INSTRUMENT_IDS = ["grand", "bright", "electric", "harpsichord", "honkytonk"] as const;
+const WAIT_HANDS = ["left", "right", "both"] as const;
 
+function readStorage(key: string): string | null {
   try {
-    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
-    if (stored === "dark" || stored === "light") return stored;
+    return typeof window === "undefined" ? null : window.localStorage.getItem(key);
   } catch {
-    /* localStorage may throw in private/incognito mode */
+    return null;
+  }
+}
+
+function getInitialTheme(): "dark" | "light" {
+  const storedSettings = readStorage(SETTINGS_STORAGE_KEY);
+  if (storedSettings) {
+    try {
+      const parsed = JSON.parse(storedSettings) as { theme?: unknown };
+      if (parsed && typeof parsed === "object" && (parsed.theme === "dark" || parsed.theme === "light")) {
+        return parsed.theme;
+      }
+    } catch {
+      /* Ignore malformed settings and fall back to the legacy key/system theme. */
+    }
   }
 
+  const stored = readStorage(THEME_STORAGE_KEY);
+  if (stored === "dark" || stored === "light") return stored;
+
   try {
-    if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) return "dark";
+    if (typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches) {
+      return "dark";
+    }
   } catch {
     /* matchMedia not supported (very old browsers) */
   }
@@ -233,11 +255,255 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // ── "Consider later" additions ────────────────────────────────────────────
   instrument: "grand" as InstrumentId,
   waitForHand: "both" as "left" | "right" | "both",
+  waitMode: false,
+  waitStrict: false,
+  tempoMultiplier: 1,
   showNoteOutline: false,
   // ── MIDIano live-app additions ────────────────────────────────────────────
   renderOffset: 0,
   showSustainedNotes: false,
 };
+
+const PERSISTED_SETTING_KEYS: (keyof AppSettings)[] = [
+  "showFingering",
+  "showFingeringOnNotes",
+  "showHandColors",
+  "useFlats",
+  "viewportSeconds",
+  "theme",
+  "activeHands",
+  "volume",
+  "noteFilter",
+  "colorTheme",
+  "customColors",
+  "layoutMode",
+  "metronomeEnabled",
+  "noteLabelMode",
+  "fallingNotesLabelMode",
+  "pianoTheme",
+  "showGrid",
+  "showMeasureNums",
+  "showKeySignature",
+  "transposeSemitones",
+  "speedTrainer",
+  "countInBars",
+  "impactStyle",
+  "sheetMusicWhiteBackground",
+  "scrollToSeek",
+  "minNoteHeight",
+  "noteCornerRadius",
+  "showBeatLines",
+  "showSustainPedal",
+  "handVolume",
+  "instrument",
+  "waitForHand",
+  "waitMode",
+  "waitStrict",
+  "tempoMultiplier",
+  "showNoteOutline",
+  "renderOffset",
+  "showSustainedNotes",
+];
+
+function isOneOf<T extends readonly string[]>(value: unknown, values: T): value is T[number] {
+  return typeof value === "string" && (values as readonly string[]).includes(value);
+}
+
+function finiteNumber(value: unknown, fallback: number, min: number, max: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback;
+}
+
+function cloneSettings(settings: AppSettings): AppSettings {
+  return {
+    ...settings,
+    activeHands: new Set(settings.activeHands),
+    customColors: { ...settings.customColors },
+    handVolume: { ...settings.handVolume },
+    speedTrainer: { ...settings.speedTrainer },
+  };
+}
+
+function hydrateSettings(): AppSettings {
+  const hydrated = cloneSettings(DEFAULT_SETTINGS);
+  const raw = readStorage(SETTINGS_STORAGE_KEY);
+  let parsed: Record<string, unknown> = {};
+  if (raw) {
+    try {
+      const candidate: unknown = JSON.parse(raw);
+      if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+        parsed = candidate as Record<string, unknown>;
+      }
+    } catch {
+      /* Ignore malformed storage and use defaults. */
+    }
+  }
+
+  for (const key of PERSISTED_SETTING_KEYS) {
+    const value = parsed[key];
+    if (value === undefined) continue;
+    switch (key) {
+      case "activeHands":
+        if (Array.isArray(value)) hydrated.activeHands = new Set(value.filter((v): v is (typeof HANDS)[number] => isOneOf(v, HANDS)));
+        break;
+      case "customColors":
+        if (value && typeof value === "object") {
+          const c = value as Record<string, unknown>;
+          hydrated.customColors = {
+            leftHand: typeof c.leftHand === "string" ? c.leftHand : hydrated.customColors.leftHand,
+            rightHand: typeof c.rightHand === "string" ? c.rightHand : hydrated.customColors.rightHand,
+            unknown: typeof c.unknown === "string" ? c.unknown : hydrated.customColors.unknown,
+          };
+        }
+        break;
+      case "handVolume":
+        if (value && typeof value === "object") {
+          const v = value as Record<string, unknown>;
+          hydrated.handVolume = {
+            left: finiteNumber(v.left, hydrated.handVolume.left, 0, 1),
+            right: finiteNumber(v.right, hydrated.handVolume.right, 0, 1),
+          };
+        }
+        break;
+      case "speedTrainer":
+        if (value && typeof value === "object") {
+          const v = value as Record<string, unknown>;
+          hydrated.speedTrainer = {
+            enabled: typeof v.enabled === "boolean" ? v.enabled : hydrated.speedTrainer.enabled,
+            startPct: finiteNumber(v.startPct, hydrated.speedTrainer.startPct, 25, 200),
+            endPct: finiteNumber(v.endPct, hydrated.speedTrainer.endPct, 25, 200),
+            stepPct: finiteNumber(v.stepPct, hydrated.speedTrainer.stepPct, 1, 100),
+            // Current progress is transient and always starts at the configured start.
+            currentPct: finiteNumber(v.startPct, hydrated.speedTrainer.startPct, 25, 200),
+          };
+        }
+        break;
+      case "theme":
+        if (value === "dark" || value === "light") hydrated.theme = value;
+        break;
+      case "noteFilter":
+        if (isOneOf(value, NOTE_FILTERS)) hydrated.noteFilter = value;
+        break;
+      case "colorTheme":
+        if (isOneOf(value, COLOR_THEMES)) hydrated.colorTheme = value;
+        break;
+      case "layoutMode":
+        if (isOneOf(value, LAYOUT_MODES)) hydrated.layoutMode = value;
+        break;
+      case "noteLabelMode":
+      case "fallingNotesLabelMode":
+        if (isOneOf(value, NOTE_LABEL_MODES)) hydrated[key] = value;
+        break;
+      case "impactStyle":
+        if (isOneOf(value, IMPACT_STYLES)) hydrated.impactStyle = value;
+        break;
+      case "instrument":
+        if (isOneOf(value, INSTRUMENT_IDS)) hydrated.instrument = value;
+        break;
+      case "waitForHand":
+        if (isOneOf(value, WAIT_HANDS)) hydrated.waitForHand = value;
+        break;
+      case "pianoTheme":
+        if (value === "white" || value === "ivory") hydrated.pianoTheme = value;
+        break;
+      case "countInBars":
+        if (value === 0 || value === 1 || value === 2) hydrated.countInBars = value;
+        break;
+      case "waitMode":
+      case "waitStrict":
+      case "showFingering":
+      case "showFingeringOnNotes":
+      case "showHandColors":
+      case "useFlats":
+      case "metronomeEnabled":
+      case "showGrid":
+      case "showMeasureNums":
+      case "showKeySignature":
+      case "sheetMusicWhiteBackground":
+      case "scrollToSeek":
+      case "showBeatLines":
+      case "showSustainPedal":
+      case "showNoteOutline":
+      case "showSustainedNotes":
+        if (typeof value === "boolean") Object.assign(hydrated, { [key]: value });
+        break;
+      case "volume":
+        hydrated.volume = finiteNumber(value, hydrated.volume, 0, 1);
+        break;
+      case "viewportSeconds":
+        hydrated.viewportSeconds = finiteNumber(value, hydrated.viewportSeconds, 1, 10);
+        break;
+      case "minNoteHeight":
+        hydrated.minNoteHeight = finiteNumber(value, hydrated.minNoteHeight, 4, 24);
+        break;
+      case "noteCornerRadius":
+        hydrated.noteCornerRadius = finiteNumber(value, hydrated.noteCornerRadius, 0, 12);
+        break;
+      case "transposeSemitones":
+        hydrated.transposeSemitones = Math.round(finiteNumber(value, hydrated.transposeSemitones, -12, 12));
+        break;
+      case "renderOffset":
+        hydrated.renderOffset = finiteNumber(value, hydrated.renderOffset, -200, 200);
+        break;
+      case "tempoMultiplier":
+        hydrated.tempoMultiplier = finiteNumber(value, hydrated.tempoMultiplier, 0.25, 2);
+        break;
+      default:
+        break;
+    }
+  }
+  return hydrated;
+}
+
+function persistSettings(settings: AppSettings): void {
+  const snapshot: Record<string, unknown> = {};
+  for (const key of PERSISTED_SETTING_KEYS) {
+    if (key === "speedTrainer") {
+      snapshot[key] = { ...settings.speedTrainer, currentPct: settings.speedTrainer.startPct };
+    } else if (key === "activeHands") {
+      snapshot[key] = [...settings.activeHands];
+    } else if (key === "customColors") {
+      snapshot[key] = { ...settings.customColors };
+    } else if (key === "handVolume") {
+      snapshot[key] = { ...settings.handVolume };
+    } else {
+      snapshot[key] = settings[key];
+    }
+  }
+  try {
+    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(snapshot));
+    if (settings.theme === "dark" || settings.theme === "light") {
+      // Keep the old key in sync for older builds and existing bookmarks.
+      window.localStorage.setItem(THEME_STORAGE_KEY, settings.theme);
+    }
+  } catch {
+    /* Storage can be blocked or quota-limited; settings remain usable in memory. */
+  }
+}
+
+function setEngineWaitStrict(on: boolean): void {
+  syncEngine.setWaitStrict(on);
+}
+
+function applyEngineSettings(settings: AppSettings): void {
+  syncEngine.setTranspose(settings.transposeSemitones);
+  syncEngine.setCountInBars(settings.countInBars);
+  syncEngine.setSpeedTrainer(settings.speedTrainer);
+  syncEngine.setMetronome(settings.metronomeEnabled);
+  syncEngine.setActiveHands(new Set(settings.activeHands));
+  syncEngine.setHandVolume(settings.handVolume);
+  syncEngine.setWaitForHand(settings.waitForHand);
+  syncEngine.setRenderOffset(settings.renderOffset);
+  syncEngine.setTempoMultiplier(settings.tempoMultiplier);
+  // The strict setter is supplied by SyncEngine; keep this call at the boot/API boundary.
+  setEngineWaitStrict(settings.waitStrict);
+  if (settings.instrument !== DEFAULT_SETTINGS.instrument) {
+    syncEngine.setInstrument(settings.instrument).catch(console.warn);
+  }
+  syncEngine.setWaitMode(settings.waitMode);
+}
+
+const INITIAL_SETTINGS = hydrateSettings();
+applyEngineSettings(INITIAL_SETTINGS);
 
 export const useAppStore = create<AppState>((set, get) => {
   // Subscribe to SyncEngine state changes --> push into Zustand
@@ -252,7 +518,7 @@ export const useAppStore = create<AppState>((set, get) => {
     });
   });
 
-  // Speed trainer: keep currentPct in sync when the engine steps the tempo
+  // Speed trainer progress is runtime state; do not persist it on every tick/step.
   bus.on("speedTrainer:stepped", ({ currentPct }) => {
     set((s) => ({
       tempoMultiplier: currentPct / 100,
@@ -273,11 +539,11 @@ export const useAppStore = create<AppState>((set, get) => {
     loadingMessage: null,
     status: "stopped",
     currentSeconds: 0,
-    tempoMultiplier: 1.0,
+    tempoMultiplier: INITIAL_SETTINGS.tempoMultiplier,
     loopStart: null,
     loopEnd: null,
-    waitMode: false,
-    settings: DEFAULT_SETTINGS,
+    waitMode: INITIAL_SETTINGS.waitMode,
+    settings: INITIAL_SETTINGS,
     midiDeviceName: null,
     midiEnabled: false,
 
@@ -695,8 +961,13 @@ export const useAppStore = create<AppState>((set, get) => {
     seek: (seconds) => syncEngine.seek(seconds),
 
     setTempoMultiplier: (v) => {
-      syncEngine.setTempoMultiplier(v);
-      set({ tempoMultiplier: v });
+      const clamped = Math.max(0.25, Math.min(2, v));
+      syncEngine.setTempoMultiplier(clamped);
+      set((s) => ({
+        tempoMultiplier: clamped,
+        settings: { ...s.settings, tempoMultiplier: clamped },
+      }));
+      persistSettings(get().settings);
     },
 
     setLoopPoints: (start, end) => {
@@ -706,24 +977,38 @@ export const useAppStore = create<AppState>((set, get) => {
 
     setWaitMode: (on) => {
       syncEngine.setWaitMode(on);
-      set({ waitMode: on });
+      set((s) => ({ waitMode: on, settings: { ...s.settings, waitMode: on } }));
+      persistSettings(get().settings);
+    },
+
+    setWaitStrict: (on) => {
+      syncEngine.setWaitStrict(on);
+      set((s) => ({ settings: { ...s.settings, waitStrict: on } }));
+      persistSettings(get().settings);
     },
 
     setMetronome: (on) => {
       syncEngine.setMetronome(on);
       set((s) => ({ settings: { ...s.settings, metronomeEnabled: on } }));
+      persistSettings(get().settings);
     },
 
     setActiveHands: (hands) => {
-      syncEngine.setActiveHands(hands);
+      const nextHands = new Set(hands);
+      syncEngine.setActiveHands(nextHands);
       set((s) => ({
-        settings: { ...s.settings, activeHands: hands },
+        settings: { ...s.settings, activeHands: nextHands },
       }));
+      persistSettings(get().settings);
     },
 
     updateSettings: (patch) => {
       set((s) => ({ settings: { ...s.settings, ...patch } }));
       // Sync practice settings to the engine immediately
+      if ("waitMode" in patch && patch.waitMode !== undefined) syncEngine.setWaitMode(patch.waitMode);
+      if ("waitStrict" in patch && patch.waitStrict !== undefined) syncEngine.setWaitStrict(patch.waitStrict);
+      if ("tempoMultiplier" in patch && patch.tempoMultiplier !== undefined)
+        syncEngine.setTempoMultiplier(patch.tempoMultiplier);
       if ("transposeSemitones" in patch && patch.transposeSemitones !== undefined)
         syncEngine.setTranspose(patch.transposeSemitones);
       if ("countInBars" in patch && patch.countInBars !== undefined)
@@ -739,29 +1024,18 @@ export const useAppStore = create<AppState>((set, get) => {
       if ("renderOffset" in patch && patch.renderOffset !== undefined)
         syncEngine.setRenderOffset(patch.renderOffset);
 
-      // Persist theme choice across reloads. localStorage write is fire-and-forget;
-      // private/incognito mode can throw, in which case the choice just won't persist.
-      if ("theme" in patch && (patch.theme === "dark" || patch.theme === "light")) {
-        try {
-          window.localStorage.setItem(THEME_STORAGE_KEY, patch.theme);
-        } catch {
-          /* localStorage unavailable - ignore */
-        }
-      }
+      persistSettings(get().settings);
     },
 
     resetSettings: () => {
-      set({ settings: { ...DEFAULT_SETTINGS } });
-      // Re-sync engine with defaults
-      syncEngine.setTranspose(DEFAULT_SETTINGS.transposeSemitones);
-      syncEngine.setCountInBars(DEFAULT_SETTINGS.countInBars);
-      syncEngine.setSpeedTrainer(DEFAULT_SETTINGS.speedTrainer);
-      syncEngine.setMetronome(DEFAULT_SETTINGS.metronomeEnabled);
-      syncEngine.setActiveHands(DEFAULT_SETTINGS.activeHands);
-      syncEngine.setHandVolume(DEFAULT_SETTINGS.handVolume);
-      syncEngine.setWaitForHand(DEFAULT_SETTINGS.waitForHand);
-      syncEngine.setInstrument(DEFAULT_SETTINGS.instrument).catch(console.warn);
-      syncEngine.setRenderOffset(DEFAULT_SETTINGS.renderOffset);
+      const defaults = cloneSettings(DEFAULT_SETTINGS);
+      set({
+        settings: defaults,
+        tempoMultiplier: defaults.tempoMultiplier,
+        waitMode: defaults.waitMode,
+      });
+      applyEngineSettings(defaults);
+      persistSettings(defaults);
     },
 
     setMidiDevice: (name) => set({ midiDeviceName: name, midiEnabled: name !== null }),

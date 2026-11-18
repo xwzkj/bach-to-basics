@@ -1390,6 +1390,28 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             <SubHeader>Practice</SubHeader>
 
             <Row
+              label="Wait mode"
+              sublabel="pause playback until the target note is played"
+              title="Pause playback at each target note until you play it"
+            >
+              <Toggle
+                active={settings.waitMode}
+                onClick={() => updateSettings({ waitMode: !settings.waitMode })}
+              />
+            </Row>
+
+            <Row
+              label="Strict wait"
+              sublabel="only count notes pressed while waiting"
+              title="Strict mode ignores notes played early. Normal mode accepts the correct note up to 150 ms early in real time."
+            >
+              <Toggle
+                active={settings.waitStrict}
+                onClick={() => updateSettings({ waitStrict: !settings.waitStrict })}
+              />
+            </Row>
+
+            <Row
               label="Wait hand"
               sublabel="which hand triggers wait mode pauses"
               title="When Wait mode is active, choose which hand's notes cause playback to pause until you play them"

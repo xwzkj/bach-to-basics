@@ -20,6 +20,9 @@ interface SpeedTrainerOpts {
 
 // How many doc-seconds ahead to emit "note:upcoming" for FallingNotes pre-rendering.
 const LOOKAHEAD_DOC_SECONDS = 5.0;
+const WAIT_WINDOW_DOC_SECONDS = 0.06;
+const SAME_ONSET_EPSILON = 1e-6;
+const WAIT_INPUT_TOLERANCE_REAL_SECONDS = 0.15;
 const YT_DRIFT_THRESHOLD = 0.25;
 
 export interface SyncEngineState {
@@ -34,6 +37,8 @@ export interface SyncEngineState {
   handVolume: { left: number; right: number };
   /** Which hand(s) trigger wait-mode pauses. Only relevant when waitMode is on. */
   waitForHand: "left" | "right" | "both";
+  /** When true, input must arrive after the wait pause; otherwise early input is accepted. */
+  waitStrict: boolean;
 }
 
 class SyncEngine {
@@ -55,6 +60,7 @@ class SyncEngine {
     metronomeEnabled: false,
     handVolume: { left: 1, right: 1 },
     waitForHand: "both",
+    waitStrict: false,
   };
 
   private ytPlayer: YTPlayer | null = null;
@@ -79,9 +85,11 @@ class SyncEngine {
   // Freeze the chord targets when pausing; every target pitch must be played.
   private waitTargets = new Set<number>();
   private playedWaitTargets = new Set<number>();
-  /** 等待模式下被卡住的那组音的起始时间（消费整组和弦用） */
+  /** Non-strict mode accepts a target slightly before its wait pause. */
+  private earlyWaitPitches = new Map<number, Set<number>>();
+  /** Start time of the chord currently held in wait mode. */
   private waitNoteStart: number | null = null;
-  /** 视觉预渲染用的游标，和音频调度游标分开 */
+  /** Visual pre-render cursor, separate from audio scheduling cursor. */
   private announceIndex = 0;
   private speedTrainer: SpeedTrainerOpts = {
     enabled: false,
@@ -355,6 +363,12 @@ class SyncEngine {
     this.refreshWaitTargets();
   }
 
+  setWaitStrict(strict: boolean) {
+    this._state.waitStrict = strict;
+    this.earlyWaitPitches.clear();
+    this.refreshWaitTargets();
+  }
+
   async setInstrument(id: InstrumentId): Promise<void> {
     await this.audio.setInstrument(id);
   }
@@ -388,10 +402,25 @@ class SyncEngine {
   /** Called by WebMidi.js, virtual keyboard click, etc. */
   onMidiInput(midi: number, velocity: number) {
     bus.emit("input:note:on", { midi, velocity });
+    if (velocity <= 0) return;
 
-    if (velocity > 0 && this._state.status === "waiting" && this.waitTargets.delete(midi)) {
+    if (this._state.status === "waiting" && this.waitTargets.delete(midi)) {
       this.playedWaitTargets.add(midi);
       if (this.waitTargets.size === 0) this.finishWait();
+      return;
+    }
+
+    // Relaxed mode accepts a correct key shortly before the clock reaches the
+    // wait onset. Keep it attached to that onset so accompaniment is still
+    // scheduled only after the practice hand has triggered the group.
+    if (this._state.waitMode && !this._state.waitStrict && this._state.status === "playing") {
+      const current = this.clock.currentSeconds;
+      const onset = this.findEarlyWaitOnset(midi, current);
+      if (onset !== null) {
+        const pitches = this.earlyWaitPitches.get(onset) ?? new Set<number>();
+        pitches.add(midi);
+        this.earlyWaitPitches.set(onset, pitches);
+      }
     }
   }
 
@@ -451,15 +480,63 @@ class SyncEngine {
   private clearWaitTargets() {
     this.waitTargets.clear();
     this.playedWaitTargets.clear();
+    this.earlyWaitPitches.clear();
     this.waitNoteStart = null;
   }
 
   private finishWait() {
     this.consumeWaitTargets();
-    this.clearWaitTargets();
+    this.discardWaitGroup();
     this._state.status = "playing";
     this.clock.resume();
     this.emitState("playing");
+  }
+
+  private discardWaitGroup() {
+    if (this.waitNoteStart !== null) this.earlyWaitPitches.delete(this.waitNoteStart);
+    this.waitTargets.clear();
+    this.playedWaitTargets.clear();
+    this.waitNoteStart = null;
+  }
+
+  private beginWait(start: number): boolean {
+    this.playedWaitTargets.clear();
+    this.waitTargets = this.collectWaitTargets(start);
+    this.waitNoteStart = start;
+
+    if (!this._state.waitStrict) {
+      for (const [onset, pitches] of this.earlyWaitPitches) {
+        if (onset < start || onset > start + WAIT_WINDOW_DOC_SECONDS) continue;
+        for (const midi of pitches) {
+          if (this.waitTargets.delete(midi)) this.playedWaitTargets.add(midi);
+        }
+      }
+    }
+
+    return this.waitTargets.size > 0;
+  }
+
+  private findEarlyWaitOnset(midi: number, current: number): number | null {
+    if (!this.doc) return null;
+    const toleranceDocSeconds = WAIT_INPUT_TOLERANCE_REAL_SECONDS * this._state.tempoMultiplier;
+    for (const note of this.doc.notes) {
+      if (note.startSeconds < current - toleranceDocSeconds) continue;
+      if (note.startSeconds > current + toleranceDocSeconds + WAIT_WINDOW_DOC_SECONDS) break;
+      if (this.transposeNote(note).midi !== midi) continue;
+      if (!this.isWaitedNote(note)) continue;
+      return note.startSeconds;
+    }
+    return null;
+  }
+
+  private isWaitedNote(note: NoteEvent): boolean {
+    const isActive =
+      note.hand === "unknown" || this._state.activeHands.has(note.hand as "left" | "right");
+    const isWaited =
+      this._state.waitForHand === "both" ||
+      note.hand === "unknown" ||
+      note.hand === this._state.waitForHand;
+    return isActive && isWaited;
   }
 
   // Changing the selected hands must not leave stale or impossible targets.
@@ -476,7 +553,7 @@ class SyncEngine {
     if (start === null || !this.doc) return;
     while (this.noteIndex < this.doc.notes.length) {
       const n = this.doc.notes[this.noteIndex];
-      if (n.startSeconds > start + 0.06) break;
+      if (n.startSeconds > start + WAIT_WINDOW_DOC_SECONDS) break;
       // Only the practised hand was supplied by the player. Preserve the other
       // hand's accompaniment, regardless of its order in the document's chord.
       const isAccompaniment =
@@ -491,12 +568,22 @@ class SyncEngine {
     }
   }
 
+  private findWaitNoteInOnset(start: number): NoteEvent | null {
+    if (!this.doc) return null;
+    for (const note of this.doc.notes) {
+      if (note.startSeconds < start - SAME_ONSET_EPSILON) continue;
+      if (note.startSeconds > start + SAME_ONSET_EPSILON) break;
+      if (this.isWaitedNote(note)) return note;
+    }
+    return null;
+  }
+
   private collectWaitTargets(start: number): Set<number> {
     const targets = new Set<number>();
     const { activeHands, waitForHand } = this._state;
     for (const n of this.doc?.notes ?? []) {
       // Only include the current/following notes; already consumed onsets are past.
-      if (n.startSeconds < start || n.startSeconds > start + 0.06) continue;
+      if (n.startSeconds < start || n.startSeconds > start + WAIT_WINDOW_DOC_SECONDS) continue;
       if (n.hand !== "unknown" && !activeHands.has(n.hand as "left" | "right")) continue;
       if (waitForHand !== "both" && n.hand !== "unknown" && n.hand !== waitForHand) continue;
       targets.add(this.transposeNote(n).midi);
@@ -627,7 +714,7 @@ class SyncEngine {
     // ── 音频调度 ──────────────────────────────────────────────────────────────
     // 等待模式把调度窗口收到 60ms：这样每个音都在“快到”的时候被检查一次，
     // 而不是提前 5 秒就排进 Tone，导致除第一个音外永远不触发等待。
-    const schedWindow = this._state.waitMode ? 0.06 : LOOKAHEAD_DOC_SECONDS;
+    const schedWindow = this._state.waitMode ? WAIT_WINDOW_DOC_SECONDS : LOOKAHEAD_DOC_SECONDS;
     while (this.noteIndex < notes.length) {
       const note = notes[this.noteIndex];
 
@@ -638,24 +725,24 @@ class SyncEngine {
         continue;
       }
 
-      // 等待判定放在调度之前：暂停时这个音既不排进 Tone 也不前进，
-      // 由用户按键后 consumeWaitTargets() 整组消费掉。
+      // Inspect the complete onset before scheduling any note. This matters
+      // when accompaniment is listed before the practised hand in the MIDI:
+      // neither hand should sound until the waited hand has been triggered.
       if (this._state.waitMode && this._state.status === "playing") {
-        const isActive =
-          note.hand === "unknown" || this._state.activeHands.has(note.hand as "left" | "right");
-        const isWaited =
-          this._state.waitForHand === "both" ||
-          note.hand === "unknown" ||
-          note.hand === this._state.waitForHand;
-        if (isActive && isWaited) {
-          // Every note admitted by the 60ms horizon must either wait or schedule.
-          this.playedWaitTargets.clear();
-          this.waitTargets = this.collectWaitTargets(note.startSeconds);
-          this.waitNoteStart = note.startSeconds;
-          this.clock.pause();
-          this._state.status = "waiting";
-          this.emitState("waiting");
-          break;
+        const waitNote = this.findWaitNoteInOnset(note.startSeconds);
+        if (waitNote) {
+          const needsInput = this.beginWait(waitNote.startSeconds);
+          if (needsInput) {
+            this.clock.pause();
+            this._state.status = "waiting";
+            this.emitState("waiting");
+            break;
+          }
+          // All required pitches were played early in relaxed mode. Consume the
+          // group now, which schedules accompaniment only after that trigger.
+          this.consumeWaitTargets();
+          this.discardWaitGroup();
+          continue;
         }
       }
 
