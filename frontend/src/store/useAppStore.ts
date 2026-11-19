@@ -1289,8 +1289,12 @@ async function fetchMusicXml(buffer: ArrayBuffer, doc: MusicDocument, _id: strin
   });
   if (!res.ok) return;
 
-  const { musicxml } = (await res.json()) as { musicxml: string };
+  const { musicxml, keySignature } = (await res.json()) as {
+    musicxml: string;
+    keySignature?: MusicDocument["keySignature"];
+  };
   doc.musicXml = musicxml;
+  if (doc.keySignature === null && keySignature) doc.keySignature = keySignature;
 
   // Notify sheet view that MusicXML is now available
   const { document: currentDoc } = useAppStore.getState();

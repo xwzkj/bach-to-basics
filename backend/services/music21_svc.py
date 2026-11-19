@@ -141,6 +141,7 @@ def _convert(midi_bytes: bytes, title: str = "") -> str:  # noqa: C901
 
         # Split into treble/bass staves for proper piano rendering
         score = _apply_piano_split(score)
+        _infer_opening_key_signature(score)
 
         xml_tmp = tempfile.NamedTemporaryFile(suffix=".xml", delete=False)
         xml_tmp.close()
@@ -148,6 +149,10 @@ def _convert(midi_bytes: bytes, title: str = "") -> str:  # noqa: C901
         score.write("musicxml", fp=xml_tmp_name)
 
         xml = Path(xml_tmp_name).read_text(encoding="utf-8")
+
+        # music21 emits per-note instrument ids for split PartStaffs; AlphaTab
+        # interprets these as percussion articulation ids, corrupting piano pitch.
+        xml = re.sub(r"\s*<instrument\b[^>]*/>\s*", "", xml)
 
         # Strip music21-generated boilerplate that clutters the score display
         xml = re.sub(r'\s*<creator\b[^>]*>[^<]*</creator>\s*\n?', '\n    ', xml)
@@ -159,6 +164,46 @@ def _convert(midi_bytes: bytes, title: str = "") -> str:  # noqa: C901
             Path(midi_path).unlink(missing_ok=True)
         if xml_tmp_name:
             Path(xml_tmp_name).unlink(missing_ok=True)
+
+
+def _infer_opening_key_signature(score) -> None:
+    """Use a confident opening-key estimate when the MIDI has no key events."""
+    from music21 import key, stream
+
+    parts = list(score.parts)
+    if not parts or list(score.recurse().getElementsByClass(key.KeySignature)):
+        return
+
+    opening = score.measures(1, 16)
+    if len(opening.flatten().notes) < 16:
+        return
+    estimated = opening.analyze("key")
+    # Relative major/minor share a signature. Only compare competing signatures.
+    alternative = next(
+        (k for k in estimated.alternateInterpretations if k.sharps != estimated.sharps), None
+    )
+    if estimated.correlationCoefficient < 0.7 or (
+        alternative and estimated.correlationCoefficient - alternative.correlationCoefficient < 0.05
+    ):
+        return
+
+    spellings = {p.pitchClass: p.name for p in estimated.getPitches()}
+    for part in parts:
+        first_measure = part.getElementsByClass(stream.Measure).first()
+        if first_measure is None:
+            continue
+        first_measure.insert(0, key.KeySignature(estimated.sharps))
+        for event in part.recurse().notes:
+            for pitch in event.pitches:
+                spelling = spellings.get(pitch.pitchClass)
+                if spelling is None or pitch.name == spelling:
+                    continue
+                for equivalent in pitch.getAllCommonEnharmonics(alterLimit=1):
+                    if equivalent.name == spelling:
+                        pitch.name = equivalent.name
+                        pitch.octave = equivalent.octave
+                        break
+        part.makeAccidentals(inPlace=True, overrideStatus=True)
 
 
 def _apply_piano_split(score):  # noqa: C901

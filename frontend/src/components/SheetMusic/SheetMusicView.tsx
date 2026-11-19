@@ -60,6 +60,10 @@ export function SheetMusicView() {
           // edge on the last system without visibly compressing the spacing.
           stretchForce: 0.1,
           staveProfile: 0,
+          resources: {
+            mainGlyphColor: "#111827",
+            secondaryGlyphColor: "#111827",
+          },
         },
         player: {
           // enablePlayer: true is required for cursor/highlight rendering.
