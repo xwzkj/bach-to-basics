@@ -104,6 +104,8 @@ export interface AppSettings {
   waitMode: boolean;
   /** Whether Wait mode only accepts notes pressed after playback pauses. */
   waitStrict: boolean;
+  /** Infer and mark key signatures in MIDI files without key events. */
+  autoAnalyzeKey: boolean;
   /** User-selected playback tempo outside speed-trainer progress. */
   tempoMultiplier: number;
   /** Draw a colored outline stroke around falling note bars */
@@ -257,6 +259,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   waitForHand: "both" as "left" | "right" | "both",
   waitMode: false,
   waitStrict: false,
+  autoAnalyzeKey: true,
   tempoMultiplier: 1,
   showNoteOutline: false,
   // ── MIDIano live-app additions ────────────────────────────────────────────
@@ -299,6 +302,7 @@ const PERSISTED_SETTING_KEYS: (keyof AppSettings)[] = [
   "waitForHand",
   "waitMode",
   "waitStrict",
+  "autoAnalyzeKey",
   "tempoMultiplier",
   "showNoteOutline",
   "renderOffset",
@@ -410,6 +414,7 @@ function hydrateSettings(): AppSettings {
         break;
       case "waitMode":
       case "waitStrict":
+      case "autoAnalyzeKey":
       case "showFingering":
       case "showFingeringOnNotes":
       case "showHandColors":
@@ -566,7 +571,7 @@ export const useAppStore = create<AppState>((set, get) => {
         await syncEngine.loadDocument(doc);
 
         // Request MusicXML from backend (non-blocking), using the copy
-        fetchMusicXml(bufferForXml, doc, id).catch(console.warn);
+        fetchMusicXml(bufferForXml, doc, id, get().settings.autoAnalyzeKey).catch(console.warn);
       } catch (err) {
         set({ loadError: String(err) });
       } finally {
@@ -742,7 +747,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
         // Kick off MusicXML transcription so the sheet-music view eventually
         // populates, mirroring loadMidiFile's pattern. Fire-and-forget.
-        fetchMusicXml(bufferForDoc.slice(0), doc, id).catch(console.warn);
+        fetchMusicXml(bufferForDoc.slice(0), doc, id, get().settings.autoAnalyzeKey).catch(console.warn);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         set({ loadError: msg });
@@ -1277,16 +1282,24 @@ async function fetchMidiFromXml(
   }
 }
 
-async function fetchMusicXml(buffer: ArrayBuffer, doc: MusicDocument, _id: string): Promise<void> {
+async function fetchMusicXml(
+  buffer: ArrayBuffer,
+  doc: MusicDocument,
+  _id: string,
+  analyzeKey: boolean,
+): Promise<void> {
   const blob = new Blob([buffer], { type: "audio/midi" });
   const form = new FormData();
   form.append("file", blob, "track.mid");
 
   const titleParam = encodeURIComponent(doc.title ?? "");
-  const res = await fetch(`/api/transcribe/midi2musicxml?title=${titleParam}`, {
-    method: "POST",
-    body: form,
-  });
+  const res = await fetch(
+    `/api/transcribe/midi2musicxml?title=${titleParam}&analyze_key=${analyzeKey ? "true" : "false"}`,
+    {
+      method: "POST",
+      body: form,
+    }
+  );
   if (!res.ok) return;
 
   const { musicxml, keySignature } = (await res.json()) as {

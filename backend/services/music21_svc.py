@@ -75,12 +75,14 @@ async def _run_in_music21_pool(fn: Callable, *args) -> object:
         )
 
 
-async def midi_bytes_to_musicxml(midi_bytes: bytes, title: str = "") -> str:
+async def midi_bytes_to_musicxml(
+    midi_bytes: bytes, title: str = "", analyze_key: bool = True
+) -> str:
     """Convert MIDI binary to MusicXML string using music21."""
-    return await _run_in_music21_pool(_convert, midi_bytes, title)
+    return await _run_in_music21_pool(_convert, midi_bytes, title, analyze_key)
 
 
-def _convert(midi_bytes: bytes, title: str = "") -> str:  # noqa: C901
+def _convert(midi_bytes: bytes, title: str = "", analyze_key: bool = True) -> str:  # noqa: C901
     import music21
     from music21 import tempo as m21tempo
 
@@ -141,7 +143,7 @@ def _convert(midi_bytes: bytes, title: str = "") -> str:  # noqa: C901
 
         # Split into treble/bass staves for proper piano rendering
         score = _apply_piano_split(score)
-        _infer_opening_key_signature(score)
+        _infer_key_signatures(score, enabled=analyze_key)
 
         xml_tmp = tempfile.NamedTemporaryFile(suffix=".xml", delete=False)
         xml_tmp.close()
@@ -166,34 +168,89 @@ def _convert(midi_bytes: bytes, title: str = "") -> str:  # noqa: C901
             Path(xml_tmp_name).unlink(missing_ok=True)
 
 
-def _infer_opening_key_signature(score) -> None:
-    """Use a confident opening-key estimate when the MIDI has no key events."""
-    from music21 import key, stream
+def _infer_key_signatures(score, enabled: bool = True) -> None:
+    """Add conservative key changes for MIDI scores that omit key events."""
+    from music21 import key
 
     parts = list(score.parts)
-    if not parts or list(score.recurse().getElementsByClass(key.KeySignature)):
+    if not enabled or not parts or list(score.recurse().getElementsByClass(key.KeySignature)):
         return
 
-    opening = score.measures(1, 16)
-    if len(opening.flatten().notes) < 16:
-        return
-    estimated = opening.analyze("key")
-    # Relative major/minor share a signature. Only compare competing signatures.
-    alternative = next(
-        (k for k in estimated.alternateInterpretations if k.sharps != estimated.sharps), None
-    )
-    if estimated.correlationCoefficient < 0.7 or (
-        alternative and estimated.correlationCoefficient - alternative.correlationCoefficient < 0.05
-    ):
+    measure_count = len(parts[0].getElementsByClass("Measure"))
+    if measure_count < 1:
         return
 
-    spellings = {p.pitchClass: p.name for p in estimated.getPitches()}
-    for part in parts:
-        first_measure = part.getElementsByClass(stream.Measure).first()
-        if first_measure is None:
+    # Analyze overlapping 16-bar windows every 4 bars. A change is accepted
+    # only when neighboring windows agree and beat the runner-up clearly.
+    window_size = 16
+    stride = 4
+    min_correlation = 0.7
+    min_margin = 0.05
+    estimates: list[tuple[int, object] | None] = []
+    for start in range(1, measure_count + 1, stride):
+        end = start + window_size - 1
+        if end > measure_count:
+            estimates.append(None)
             continue
-        first_measure.insert(0, key.KeySignature(estimated.sharps))
+        region = score.measures(start, end)
+        if len(region.flatten().notes) < 16:
+            estimates.append(None)
+            continue
+        estimate = region.analyze("key")
+        competing = next(
+            (item for item in estimate.alternateInterpretations if item.sharps != estimate.sharps),
+            None,
+        )
+        confident = estimate.correlationCoefficient >= min_correlation and (
+            competing is None or estimate.correlationCoefficient - competing.correlationCoefficient >= min_margin
+        )
+        estimates.append((start, estimate) if confident else None)
+
+    signatures: list[tuple[int, object]] = []
+    current_signature = None
+    for i in range(len(estimates)):
+        candidate = estimates[i]
+        if candidate is None:
+            continue
+        start, estimate = candidate
+        signature = estimate.sharps
+        if current_signature is None:
+            if i != 0:
+                continue
+            signatures.append((1, estimate))
+            current_signature = signature
+            continue
+        if signature == current_signature:
+            continue
+        if i + 1 >= len(estimates) or estimates[i + 1] is None:
+            continue
+        next_estimate = estimates[i + 1][1]
+        if next_estimate.sharps != signature:
+            continue
+        change_measure = min(start + window_size // 2, measure_count)
+        signatures.append((change_measure, estimate))
+        current_signature = signature
+
+    if not signatures:
+        return
+
+    for part in parts:
+        measures = list(part.getElementsByClass("Measure"))
+        for start, estimate in signatures:
+            measure = next((m for m in measures if m.number == start), None)
+            if measure is not None:
+                measure.insert(0, key.KeySignature(estimate.sharps))
+
+        ordered_signatures = sorted(signatures, key=lambda item: item[0])
         for event in part.recurse().notes:
+            active = event.getContextByClass("Measure")
+            if active is None:
+                continue
+            applicable = [item for item in ordered_signatures if item[0] <= active.number]
+            if not applicable:
+                continue
+            estimate = applicable[-1][1]
+            spellings = {p.pitchClass: p.name for p in estimate.getPitches()}
             for pitch in event.pitches:
                 spelling = spellings.get(pitch.pitchClass)
                 if spelling is None or pitch.name == spelling:

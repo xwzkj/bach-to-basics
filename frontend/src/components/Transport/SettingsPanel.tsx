@@ -1075,6 +1075,17 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
             </Row>
 
             <Row
+              label="Analyze MIDI key changes"
+              sublabel="infer signatures when the MIDI omits them"
+              title="Analyze key signatures for MIDI files without key events. Confident later key changes are marked in the score."
+            >
+              <Toggle
+                active={settings.autoAnalyzeKey}
+                onClick={() => updateSettings({ autoAnalyzeKey: !settings.autoAnalyzeKey })}
+              />
+            </Row>
+
+            <Row
               label="White score background"
               sublabel="keep sheet music on white in dark mode"
               title="Render sheet music on a white background even in dark mode"

@@ -80,7 +80,9 @@ def _rm(path: str) -> None:
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/midi2musicxml")
-async def midi_to_musicxml(file: UploadFile, title: str = Query(default="")):
+async def midi_to_musicxml(
+    file: UploadFile, title: str = Query(default=""), analyze_key: bool = Query(default=True)
+):
     """Convert a MIDI file to MusicXML for sheet music rendering."""
     try:
         _check_ext(file.filename or "track.mid", _MIDI_EXTS)
@@ -89,14 +91,21 @@ async def midi_to_musicxml(file: UploadFile, title: str = Query(default="")):
 
         from services.music21_svc import midi_bytes_to_musicxml
         safe_title = _safe_title(title)
-        musicxml = await midi_bytes_to_musicxml(data, title=safe_title)
+        musicxml = await midi_bytes_to_musicxml(data, title=safe_title, analyze_key=analyze_key)
         from xml.etree import ElementTree as ET
         root = ET.fromstring(musicxml)
         fifths = root.findtext(".//attributes/key/fifths")
         key_names = {0: "C", 1: "G", 2: "D", 3: "A", 4: "E", 5: "B", 6: "F#", 7: "C#",
                      -1: "F", -2: "Bb", -3: "Eb", -4: "Ab", -5: "Db", -6: "Gb", -7: "Cb"}
         key_mode = root.findtext(".//attributes/key/mode") or "major"
-        key_signature = {"key": key_names[int(fifths)], "scale": "minor" if key_mode == "minor" else "major"} if fifths is not None and int(fifths) in key_names else None
+        key_signature = (
+            {
+                "key": key_names[int(fifths)],
+                "scale": "minor" if key_mode == "minor" else "major",
+            }
+            if fifths is not None and int(fifths) in key_names
+            else None
+        )
 
         # L2 - prevent caching of user data
         return JSONResponse({"musicxml": musicxml, "keySignature": key_signature}, headers={"Cache-Control": "no-store"})
